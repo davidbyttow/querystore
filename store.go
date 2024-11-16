@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path"
@@ -28,36 +29,37 @@ const (
 	ColumnTypeString
 )
 
-type ColumnFile struct {
-	typ  ColumnType
-	fp   *os.File
-	size int64
+var columnTypeToSuffix = map[ColumnType]string{
+	ColumnTypeBool:    "bool",
+	ColumnTypeInt64:   "int64",
+	ColumnTypeFloat64: "float64",
+	ColumnTypeString:  "str",
 }
 
-func OpenColumnFile(path string, typ ColumnType, writer bool) (*ColumnFile, error) {
-	var size int64
-	stat, err := os.Stat(path)
-	if err != nil && !os.IsNotExist(err) {
-		return nil, err
-	}
-	println(path, err)
-	if os.IsExist(err) {
-		size = stat.Size()
-	}
-	mode := os.O_RDONLY
-	if writer {
-		mode = os.O_WRONLY | os.O_APPEND | os.O_CREATE
-	}
-	indexFile, err := os.OpenFile(path, mode, filePerm)
-	if err != nil {
-		return nil, err
-	}
-	return &ColumnFile{typ: typ, fp: indexFile, size: size}, nil
+var columnSuffixToType = biMap(columnTypeToSuffix)
+
+type ColumnHandle struct {
+	path    string
+	typ     ColumnType
+	writeFp *os.File
 }
 
-func (cf *ColumnFile) IndexedWrite(index int64, v any) error {
+func (ch *ColumnHandle) Write(b []byte) error {
+	if ch.writeFp == nil {
+		fp, err := os.OpenFile(ch.path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, filePerm)
+		if err != nil {
+			return err
+		}
+		ch.writeFp = fp
+	}
+	_, err := ch.writeFp.Write(b)
+	return err
+}
+
+func (cf *ColumnHandle) IndexedWrite(index int64, v any) error {
+	// TODO: handle conversions where `v` does not match the expected type
+
 	var data []byte
-	var err error
 	switch cf.typ {
 	case ColumnTypeBool:
 		var buf [9]byte
@@ -81,30 +83,114 @@ func (cf *ColumnFile) IndexedWrite(index int64, v any) error {
 	case ColumnTypeString:
 		str := v.(string)
 		len := len(str)
-		buf := make([]byte, 16+len)
+		buf := make([]byte, 8+2+len)
 		binary.LittleEndian.PutUint64(buf[:8], uint64(index))
-		binary.LittleEndian.PutUint64(buf[8:16], uint64(len))
+		binary.LittleEndian.PutUint16(buf[8:10], uint16(len))
+		copy(buf[10:], str)
 		data = buf[:]
 	}
-	_, err = cf.fp.Write(data[:])
-	return err
+	return cf.Write(data[:])
 }
 
-func (cf *ColumnFile) Close() error {
-	return cf.fp.Close()
+type ColumnReader struct {
+	fp       *os.File
+	typ      ColumnType
+	curIndex int64
+	curVal   any
 }
 
-type ColumnWriter struct {
-	lock      sync.Mutex
-	dir       string
-	next      int64
-	indexFile *ColumnFile
-	tsFile    *ColumnFile
-	files     map[string]*ColumnFile
+func (cr *ColumnReader) SeekToIndex(targetIndex int64) (any, error) {
+	if targetIndex < cr.curIndex {
+		panic("cannot seek backwards")
+	}
+
+	if targetIndex == cr.curIndex {
+		return cr.curVal, nil
+	}
+
+	// TODO: read in chunks, of overreading then save the last index and value
+	var index int64
+	var val any
+	var err error
+	if cr.typ == ColumnTypeString {
+		var buf [10]byte
+		_, err = cr.fp.Read(buf[:])
+		index = int64(binary.LittleEndian.Uint64(buf[:8]))
+		len := int16(binary.LittleEndian.Uint16(buf[8:10]))
+		strBuf := make([]byte, len)
+		cr.fp.Read(strBuf[:])
+		val = string(strBuf)
+	} else {
+		switch cr.typ {
+		case ColumnTypeBool:
+			var buf [9]byte
+			_, err = cr.fp.Read(buf[:])
+			index = int64(binary.LittleEndian.Uint64(buf[:8]))
+			val = buf[8] == 1
+		case ColumnTypeInt64:
+			var buf [16]byte
+			_, err = cr.fp.Read(buf[:])
+			index = int64(binary.LittleEndian.Uint64(buf[:8]))
+			val = int64(binary.LittleEndian.Uint64(buf[8:16]))
+		case ColumnTypeFloat64:
+			var buf [16]byte
+			_, err = cr.fp.Read(buf[:])
+			index = int64(binary.LittleEndian.Uint64(buf[:8]))
+			val = math.Float64frombits(binary.LittleEndian.Uint64(buf[8:16]))
+		}
+		if err == io.EOF {
+			return nil, nil
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	if index == targetIndex {
+		return val, nil
+	}
+	if index > targetIndex {
+		cr.curIndex = index
+		cr.curVal = val
+	}
+	return nil, nil
 }
 
-func OpenColumnWriter(dir string) (*ColumnWriter, error) {
-	exists, err := FileExists(dir)
+func (cr *ColumnReader) Close() error {
+	if cr.fp != nil {
+		err := cr.fp.Close()
+		cr.fp = nil
+		return err
+	}
+	return nil
+}
+
+func (ch *ColumnHandle) createReader() (*ColumnReader, error) {
+	fp, err := os.OpenFile(ch.path, os.O_RDONLY, filePerm)
+	if err != nil {
+		return nil, err
+	}
+	return &ColumnReader{fp: fp, typ: ch.typ, curIndex: -1}, nil
+}
+
+func (cf *ColumnHandle) Close() error {
+	if cf.writeFp != nil {
+		err := cf.writeFp.Close()
+		cf.writeFp = nil
+		return err
+	}
+	return nil
+}
+
+type ColumnFS struct {
+	lock          sync.Mutex
+	dir           string
+	nextID        int64
+	indexHandle   *ColumnHandle
+	columnHandles map[string]*ColumnHandle
+}
+
+func OpenColumnFS(dir string) (*ColumnFS, error) {
+	exists, err := fileExists(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -113,83 +199,92 @@ func OpenColumnWriter(dir string) (*ColumnWriter, error) {
 			return nil, err
 		}
 	}
-	indexFile, err := OpenColumnFile(path.Join(dir, indexFileName), ColumnTypeInt64, true)
-	if err != nil {
-		return nil, err
-	}
-	tsFile, err := OpenColumnFile(path.Join(dir, timestampFileName), ColumnTypeInt64, true)
-	if err != nil {
-		return nil, err
-	}
-	if indexFile.size != tsFile.size {
-		return nil, fmt.Errorf("mismatch index and timestamp file sizes: %d != %d", indexFile.size, tsFile.size)
-	}
-	files := map[string]*ColumnFile{
-		indexFileName: indexFile,
 
-		timestampFileName: tsFile,
+	indexPath := path.Join(dir, indexFileName)
+	indexHandle := &ColumnHandle{path: indexPath, typ: ColumnTypeInt64}
+	handles := map[string]*ColumnHandle{
+		indexFileName: indexHandle,
 	}
-	next := int64(indexFile.size << 3)
-	return &ColumnWriter{dir: dir, indexFile: indexFile, tsFile: tsFile, files: files, next: next}, nil
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	var indexSize int64
+	for _, de := range entries {
+		if !strings.HasSuffix(de.Name(), extension) {
+			continue
+		}
+		if de.Name() == indexFileName {
+			fi, err := de.Info()
+			if err != nil {
+				return nil, err
+			}
+			indexSize = fi.Size()
+		}
+		colNameAndType := strings.TrimSuffix(de.Name(), "."+extension)
+		parts := strings.Split(colNameAndType, ".")
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid column file name: %s", de.Name())
+		}
+		colName := parts[0]
+		colType, ok := columnSuffixToType[parts[1]]
+		if !ok {
+			panic(fmt.Sprintf("unknown column type: %s", parts[1]))
+		}
+		ch := &ColumnHandle{path: path.Join(dir, de.Name()), typ: colType}
+		handles[colName] = ch
+	}
+
+	if indexSize%16 != 0 {
+		panic("index file size is not a multiple of 16")
+	}
+
+	nextID := int64(indexSize / 16)
+	return &ColumnFS{dir: dir, indexHandle: indexHandle, columnHandles: handles, nextID: nextID}, nil
 }
 
-func (cw *ColumnWriter) WriteColumns(fields map[string]any) error {
-	cw.lock.Lock()
-	defer cw.lock.Unlock()
+func (fs *ColumnFS) WriteColumns(fields map[string]any) error {
+	fs.lock.Lock()
+	defer fs.lock.Unlock()
 
 	for name, v := range fields {
 		if strings.HasPrefix(name, "__") {
 			return fmt.Errorf("column name cannot start with '__': %s", name)
 		}
-		var ct ColumnType
-		switch v.(type) {
-		case bool:
-			ct = ColumnTypeBool
-		case string:
-			ct = ColumnTypeString
-		case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
-			ct = ColumnTypeInt64
-		case float32, float64:
-			ct = ColumnTypeFloat64
-		default:
-			return fmt.Errorf("unsupported type: %T", v)
-		}
-		_, ok := cw.files[name]
-		if !ok {
-			cf, err := OpenColumnFile(path.Join(cw.dir, name+"."+extension), ct, true)
-			if err != nil {
-				return err
-			}
-			cw.files[name] = cf
+		ch := fs.columnHandles[name]
+		if ch == nil {
+			typ := valueColumnType(v)
+			fn := makeColumnFileName(name, typ)
+			ch := &ColumnHandle{path: path.Join(fs.dir, fn), typ: typ}
+			fs.columnHandles[name] = ch
 		}
 	}
 
-	// TODO: handle partial failure somehow
-	index := cw.next
-	var buf [8]byte
-	binary.LittleEndian.PutUint64(buf[:], uint64(index))
-	_, err := cw.indexFile.fp.Write(buf[:])
+	index := fs.nextID
+	ts := time.Now().UnixNano()
+
+	var buf [16]byte
+	binary.LittleEndian.PutUint64(buf[:8], uint64(index))
+	binary.LittleEndian.PutUint64(buf[8:16], uint64(ts))
+	err := fs.indexHandle.Write(buf[:])
 	if err != nil {
 		return err
 	}
-	cw.next += 1
-	ts := time.Now().UnixNano()
-	if err = cw.tsFile.IndexedWrite(index, ts); err != nil {
-		return err
-	}
-
 	for name, v := range fields {
-		cf := cw.files[name]
+		cf := fs.columnHandles[name]
 		if err := cf.IndexedWrite(index, v); err != nil {
 			return err
 		}
 	}
+	fs.nextID += 1
 	return nil
 }
 
-func (fs *ColumnWriter) Close() error {
+func (fs *ColumnFS) Close() error {
 	var errs []error
-	for _, f := range fs.files {
+	for _, f := range fs.columnHandles {
 		if err := f.Close(); err != nil {
 			errs = append(errs, err)
 		}
@@ -198,13 +293,69 @@ func (fs *ColumnWriter) Close() error {
 }
 
 type ColumnarStore struct {
-	fs *ColumnWriter
+	fs *ColumnFS
 }
 
 func (s *ColumnarStore) Append(fields map[string]any) error {
 	return s.fs.WriteColumns(fields)
 }
 
-func NewColumnarStore(fs *ColumnWriter) *ColumnarStore {
+func (s *ColumnarStore) Query(q *Query) ([]map[string]any, error) {
+	lastID := s.fs.nextID
+
+	cols := map[string]bool{}
+	rows := []map[string]any{}
+
+	for _, f := range q.Filters {
+		cols[f.Attribute] = true
+	}
+	if q.AggregatorAttribute != "" {
+		cols[q.AggregatorAttribute] = true
+	}
+	cf := map[string]*ColumnReader{}
+	for col := range cols {
+		ch := s.fs.columnHandles[col]
+		if ch == nil {
+			continue
+		}
+		cr, err := ch.createReader()
+		if err != nil {
+			return nil, err
+		}
+		cf[col] = cr
+	}
+
+	for i := range lastID {
+		pass := true
+		row := map[string]any{
+			"__index":     i,
+			"__timestamp": 0,
+		}
+		for _, f := range q.Filters {
+			cr := cf[f.Attribute]
+			rowValue, err := cr.SeekToIndex(i)
+			if err != nil {
+				return nil, err
+			}
+			if rowValue == nil {
+				pass = false
+				break
+			}
+			filterValue := castValueToColumnType(f.Value, cr.typ)
+			if !conditionals[f.Condition][cr.typ](rowValue, filterValue) {
+				pass = false
+				break
+			}
+			row[f.Attribute] = rowValue
+		}
+		if pass {
+			rows = append(rows, row)
+		}
+	}
+
+	return rows, nil
+}
+
+func NewColumnarStore(fs *ColumnFS) *ColumnarStore {
 	return &ColumnarStore{fs: fs}
 }
